@@ -42,8 +42,9 @@ It implements core parts of the RFB protocol to connect to remote desktops and i
 - `DeskPad/Views`: Connection UI, remote desktop view, and session toolbar
 
 ## Requirements
-- Xcode 15 or later
-- iPadOS 17.0 or later
+- Xcode 26 or later
+- iPadOS 26.0 or later
+- This app requires a hardware keyboard and a pointing device, including the iPad Magic Keyboard.
 
 ## Getting Started
 1. Clone the repository.
