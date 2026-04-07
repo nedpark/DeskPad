@@ -26,6 +26,21 @@ final class InputManager {
         connection?.sendKeyEvent(downFlag: false, keysym: keysym)
     }
 
+    /// Send text from the virtual keyboard as key press/release events.
+    func sendText(_ text: String) {
+        for char in text {
+            guard let keysym = KeySymMapping.keysym(forCharacter: char) else { continue }
+            connection?.sendKeyEvent(downFlag: true, keysym: keysym)
+            connection?.sendKeyEvent(downFlag: false, keysym: keysym)
+        }
+    }
+
+    /// Send a backspace key event (for virtual keyboard delete).
+    func sendBackspace() {
+        connection?.sendKeyEvent(downFlag: true, keysym: 0xFF08)  // XK_BackSpace
+        connection?.sendKeyEvent(downFlag: false, keysym: 0xFF08)
+    }
+
     // MARK: - Pointer Events
 
     func pointerMoved(x: UInt16, y: UInt16) {

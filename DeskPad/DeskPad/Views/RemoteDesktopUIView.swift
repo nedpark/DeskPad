@@ -3,6 +3,8 @@ import UIKit
 protocol RemoteDesktopUIViewDelegate: AnyObject {
     func remoteDesktopView(_ view: RemoteDesktopUIView, keyDown key: UIKey)
     func remoteDesktopView(_ view: RemoteDesktopUIView, keyUp key: UIKey)
+    func remoteDesktopView(_ view: RemoteDesktopUIView, didInsertText text: String)
+    func remoteDesktopViewDidDeleteBackward(_ view: RemoteDesktopUIView)
     func remoteDesktopView(_ view: RemoteDesktopUIView, pointerMovedTo desktopPoint: CGPoint)
     func remoteDesktopView(_ view: RemoteDesktopUIView, mouseDown button: Int, at desktopPoint: CGPoint)
     func remoteDesktopView(_ view: RemoteDesktopUIView, mouseUp button: Int, at desktopPoint: CGPoint)
@@ -25,6 +27,10 @@ final class RemoteDesktopUIView: UIView {
     private var zoomScale: CGFloat = 1.0
     private var panOffset: CGPoint = .zero
 
+    // Virtual keyboard state
+    private var wantsVirtualKeyboard = false
+    private static let emptyInputView = UIView(frame: .zero)
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
@@ -40,6 +46,22 @@ final class RemoteDesktopUIView: UIView {
     }
 
     override var canBecomeFirstResponder: Bool { true }
+
+    /// Returns an empty view to suppress the virtual keyboard, or nil to show it.
+    override var inputView: UIView? {
+        wantsVirtualKeyboard ? nil : Self.emptyInputView
+    }
+
+    /// Toggle the virtual keyboard visibility.
+    func toggleVirtualKeyboard() {
+        wantsVirtualKeyboard.toggle()
+        if isFirstResponder {
+            resignFirstResponder()
+            becomeFirstResponder()
+        } else {
+            becomeFirstResponder()
+        }
+    }
 
     // MARK: - Rendering
 
@@ -199,31 +221,115 @@ final class RemoteDesktopUIView: UIView {
 
     // MARK: - Keyboard Input
 
+    /// Determine whether a key press should be handled directly as a VNC key event
+    /// rather than routed through the iOS text input system.
+    /// Modifier keys, special keys, and keyboard shortcuts (Ctrl/Alt/Cmd+key)
+    /// are handled directly. Printable characters without command modifiers are
+    /// routed through the text input system so that IME composition (Korean, etc.) works.
+    private func shouldDirectlyHandle(_ key: UIKey) -> Bool {
+        if KeySymMapping.isNonPrintableKey(key.keyCode) { return true }
+        let shortcutModifiers: UIKeyModifierFlags = [.control, .alternate, .command]
+        return !key.modifierFlags.intersection(shortcutModifiers).isEmpty
+    }
+
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        var handled = false
+        var unhandledPresses = Set<UIPress>()
         for press in presses {
-            guard let key = press.key else { continue }
-            delegate?.remoteDesktopView(self, keyDown: key)
-            handled = true
+            guard let key = press.key else {
+                unhandledPresses.insert(press)
+                continue
+            }
+            if shouldDirectlyHandle(key) {
+                delegate?.remoteDesktopView(self, keyDown: key)
+            } else {
+                unhandledPresses.insert(press)
+            }
         }
-        if !handled {
-            super.pressesBegan(presses, with: event)
+        if !unhandledPresses.isEmpty {
+            super.pressesBegan(unhandledPresses, with: event)
         }
     }
 
     override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        var handled = false
+        var unhandledPresses = Set<UIPress>()
         for press in presses {
-            guard let key = press.key else { continue }
-            delegate?.remoteDesktopView(self, keyUp: key)
-            handled = true
+            guard let key = press.key else {
+                unhandledPresses.insert(press)
+                continue
+            }
+            if shouldDirectlyHandle(key) {
+                delegate?.remoteDesktopView(self, keyUp: key)
+            } else {
+                unhandledPresses.insert(press)
+            }
         }
-        if !handled {
-            super.pressesEnded(presses, with: event)
+        if !unhandledPresses.isEmpty {
+            super.pressesEnded(unhandledPresses, with: event)
         }
     }
 
     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        pressesEnded(presses, with: event)
+        var unhandledPresses = Set<UIPress>()
+        for press in presses {
+            guard let key = press.key else {
+                unhandledPresses.insert(press)
+                continue
+            }
+            if shouldDirectlyHandle(key) {
+                delegate?.remoteDesktopView(self, keyUp: key)
+            } else {
+                unhandledPresses.insert(press)
+            }
+        }
+        if !unhandledPresses.isEmpty {
+            super.pressesCancelled(unhandledPresses, with: event)
+        }
+    }
+}
+
+// MARK: - UIKeyInput (Virtual Keyboard)
+
+extension RemoteDesktopUIView: UIKeyInput {
+
+    var hasText: Bool { true }
+
+    func insertText(_ text: String) {
+        delegate?.remoteDesktopView(self, didInsertText: text)
+    }
+
+    func deleteBackward() {
+        delegate?.remoteDesktopViewDidDeleteBackward(self)
+    }
+
+    // MARK: UITextInputTraits
+
+    var autocorrectionType: UITextAutocorrectionType {
+        get { .no }
+        set {}
+    }
+
+    var autocapitalizationType: UITextAutocapitalizationType {
+        get { .none }
+        set {}
+    }
+
+    var spellCheckingType: UITextSpellCheckingType {
+        get { .no }
+        set {}
+    }
+
+    var smartQuotesType: UITextSmartQuotesType {
+        get { .no }
+        set {}
+    }
+
+    var smartDashesType: UITextSmartDashesType {
+        get { .no }
+        set {}
+    }
+
+    var smartInsertDeleteType: UITextSmartInsertDeleteType {
+        get { .no }
+        set {}
     }
 }

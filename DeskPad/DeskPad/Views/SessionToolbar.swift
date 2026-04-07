@@ -3,6 +3,7 @@ import SwiftUI
 struct SessionToolbar: View {
     let desktopName: String
     let onDisconnect: () -> Void
+    let onToggleKeyboard: () -> Void
 
     @State private var isExpanded = false
 
@@ -20,6 +21,11 @@ struct SessionToolbar: View {
                     }
 
                     Spacer()
+
+                    Button(action: onToggleKeyboard) {
+                        Image(systemName: "keyboard")
+                            .font(.caption)
+                    }
 
                     Button(action: onDisconnect) {
                         Label("Disconnect", systemImage: "xmark.circle.fill")

@@ -2,7 +2,14 @@ import UIKit
 
 enum KeySymMapping {
 
+    /// Returns true if the key code is a modifier or special (non-printable) key
+    /// that should be sent directly as a VNC key event rather than through text input.
+    static func isNonPrintableKey(_ keyCode: UIKeyboardHIDUsage) -> Bool {
+        modifierKeysym(for: keyCode) != nil || specialKeysym(for: keyCode) != nil
+    }
+
     /// Convert a UIKey to an X11 keysym for the RFB KeyEvent message.
+    /// Used for modifier keys, special keys, and keyboard shortcuts (Ctrl/Alt/Cmd + key).
     static func keysym(for key: UIKey) -> UInt32? {
         // Check modifier keys first
         if let modKeysym = modifierKeysym(for: key.keyCode) {
@@ -14,18 +21,64 @@ enum KeySymMapping {
             return specialKeysym
         }
 
-        // For printable characters, use the character value
-        // X11 keysyms for Latin-1 (0x20-0x7E) match Unicode code points
-        let chars = key.characters
-        if let scalar = chars.unicodeScalars.first {
-            let codePoint = scalar.value
-            if codePoint >= 0x20 && codePoint <= 0x7E {
-                return codePoint
-            }
-            // Latin-1 supplement (0xA0-0xFF) also maps directly
-            if codePoint >= 0xA0 && codePoint <= 0xFF {
-                return codePoint
-            }
+        // For printable characters, try key.characters first
+        if let keysym = keysymFromString(key.characters) {
+            return keysym
+        }
+
+        // Fall back to charactersIgnoringModifiers for shortcuts (e.g. Ctrl+C)
+        if let keysym = keysymFromString(key.charactersIgnoringModifiers) {
+            return keysym
+        }
+
+        return nil
+    }
+
+    /// Map a character string to an X11 keysym.
+    private static func keysymFromString(_ chars: String) -> UInt32? {
+        guard let scalar = chars.unicodeScalars.first else { return nil }
+        let codePoint = scalar.value
+        // Latin-1 printable (0x20-0x7E) maps directly
+        if codePoint >= 0x20 && codePoint <= 0x7E {
+            return codePoint
+        }
+        // Latin-1 supplement (0xA0-0xFF) maps directly
+        if codePoint >= 0xA0 && codePoint <= 0xFF {
+            return codePoint
+        }
+        // Unicode keysym for characters beyond Latin-1 (Korean, CJK, etc.)
+        if codePoint > 0xFF {
+            return 0x0100_0000 | codePoint
+        }
+        return nil
+    }
+
+    /// Convert a Character from text input (virtual/hardware keyboard via IME) to an X11 keysym.
+    static func keysym(forCharacter char: Character) -> UInt32? {
+        // Handle special whitespace characters
+        switch char {
+        case "\n", "\r":
+            return 0xFF0D // XK_Return
+        case "\t":
+            return 0xFF09 // XK_Tab
+        default:
+            break
+        }
+
+        guard let scalar = char.unicodeScalars.first else { return nil }
+        let codePoint = scalar.value
+
+        // Latin-1 printable (0x20-0x7E) maps directly to X11 keysyms
+        if codePoint >= 0x20 && codePoint <= 0x7E {
+            return codePoint
+        }
+        // Latin-1 supplement (0xA0-0xFF) also maps directly
+        if codePoint >= 0xA0 && codePoint <= 0xFF {
+            return codePoint
+        }
+        // Unicode keysym for characters beyond Latin-1 (Korean, CJK, etc.)
+        if codePoint > 0xFF {
+            return 0x0100_0000 | codePoint
         }
 
         return nil

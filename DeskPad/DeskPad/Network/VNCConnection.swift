@@ -13,6 +13,7 @@ final class VNCConnection {
     private(set) var framebufferImage: CGImage?
     private(set) var desktopName: String = ""
     private(set) var desktopSize: CGSize = .zero
+    private(set) var framebufferWarning: String?
 
     // MARK: - Private Properties
 
@@ -25,6 +26,11 @@ final class VNCConnection {
     private var fbWidth: UInt16 = 0
     private var fbHeight: UInt16 = 0
     private var serverVersion: RFBVersion = .rfb38
+    private var hasReceivedFirstFrame = false
+    private var consecutiveDecodeErrors = 0
+    private var framebufferTimeoutTask: Task<Void, Never>?
+    private static let maxConsecutiveDecodeErrors = 5
+    private static let framebufferTimeoutSeconds: UInt64 = 10
 
     // MARK: - Connection Lifecycle
 
@@ -53,6 +59,8 @@ final class VNCConnection {
     }
 
     func disconnect() {
+        framebufferTimeoutTask?.cancel()
+        framebufferTimeoutTask = nil
         connection?.cancel()
         connection = nil
         framebuffer = nil
@@ -60,6 +68,9 @@ final class VNCConnection {
         state = .disconnected
         desktopName = ""
         desktopSize = .zero
+        framebufferWarning = nil
+        hasReceivedFirstFrame = false
+        consecutiveDecodeErrors = 0
     }
 
     // MARK: - Input Forwarding
@@ -325,6 +336,15 @@ final class VNCConnection {
 
         state = .connected
 
+        // Start timeout for initial framebuffer update
+        framebufferTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.framebufferTimeoutSeconds * 1_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            if !self.hasReceivedFirstFrame && self.state == .connected {
+                self.framebufferWarning = "No screen data received from the server. The remote desktop may not be sending display updates."
+            }
+        }
+
         // Start the receive loop
         startReceiveLoop()
     }
@@ -370,16 +390,32 @@ final class VNCConnection {
                 // Successfully parsed - remove consumed bytes
                 let consumed = cursor.consumedCount
                 receiveBuffer.removeFirst(consumed)
+                consecutiveDecodeErrors = 0
 
                 handleServerMessage(message)
             } catch RFBDecodeError.insufficientData {
                 // Need more data
                 break
             } catch {
-                // Protocol error - skip this byte and try again
-                if !receiveBuffer.isEmpty {
-                    receiveBuffer.removeFirst(1)
+                consecutiveDecodeErrors += 1
+
+                // Once desynced, byte-by-byte skipping cannot recover RFB protocol.
+                // Clear the buffer and request a fresh full framebuffer update.
+                receiveBuffer.removeAll()
+
+                if consecutiveDecodeErrors >= Self.maxConsecutiveDecodeErrors {
+                    framebufferWarning = "Repeated display protocol errors. The server may be using an unsupported encoding."
                 }
+
+                // Re-request full framebuffer update to try to re-sync
+                if state == .connected {
+                    sendData(RFBMessageEncoder.encodeFramebufferUpdateRequest(
+                        incremental: false,
+                        x: 0, y: 0,
+                        width: fbWidth, height: fbHeight
+                    ))
+                }
+                break
             }
         }
     }
@@ -411,6 +447,14 @@ final class VNCConnection {
 
     private func applyRectangles(_ rectangles: [RFBRectangle]) {
         guard let framebuffer else { return }
+        guard !rectangles.isEmpty else { return }
+
+        if !hasReceivedFirstFrame {
+            hasReceivedFirstFrame = true
+            framebufferTimeoutTask?.cancel()
+            framebufferTimeoutTask = nil
+            framebufferWarning = nil
+        }
 
         for rect in rectangles {
             switch rect.encodingType {
@@ -437,11 +481,7 @@ final class VNCConnection {
             }
         }
 
-        // Publish new image on main actor
-        let newImage = framebuffer.createImage()
-        Task { @MainActor [weak self] in
-            self?.framebufferImage = newImage
-        }
+        framebufferImage = framebuffer.createImage()
     }
 
     // MARK: - Network Helpers

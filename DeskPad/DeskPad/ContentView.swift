@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     var connection: VNCConnection
     @State private var inputManager: InputManager?
+    @State private var keyboardToggleCount = 0
 
     var body: some View {
         ZStack {
@@ -70,15 +71,68 @@ struct ContentView: View {
                 RemoteDesktopView(
                     desktopImage: connection.framebufferImage,
                     desktopSize: connection.desktopSize,
-                    inputManager: inputManager
+                    inputManager: inputManager,
+                    keyboardToggleCount: keyboardToggleCount
                 )
                 .ignoresSafeArea()
             }
 
+            if connection.framebufferImage == nil {
+                waitingForFrameView
+            }
+
+            if let warning = connection.framebufferWarning {
+                framebufferWarningBanner(warning)
+            }
+
             SessionToolbar(
                 desktopName: connection.desktopName,
-                onDisconnect: { connection.disconnect() }
+                onDisconnect: { connection.disconnect() },
+                onToggleKeyboard: { keyboardToggleCount += 1 }
             )
+        }
+    }
+
+    // MARK: - Waiting for Frame
+
+    private var waitingForFrameView: some View {
+        VStack(spacing: 16) {
+            ProgressView()
+                .scaleEffect(1.2)
+            Text("Waiting for screen data...")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.black)
+    }
+
+    // MARK: - Warning Banner
+
+    private func framebufferWarningBanner(_ message: String) -> some View {
+        VStack {
+            Spacer()
+            HStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.yellow)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.leading)
+                Spacer()
+                Button {
+                    connection.disconnect()
+                } label: {
+                    Text("Disconnect")
+                        .font(.caption)
+                        .fontWeight(.medium)
+                        .foregroundStyle(.red)
+                }
+            }
+            .padding(12)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .padding(.horizontal, 16)
+            .padding(.bottom, 16)
         }
     }
 

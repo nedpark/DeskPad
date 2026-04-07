@@ -5,6 +5,7 @@ struct RemoteDesktopView: UIViewRepresentable {
     let desktopImage: CGImage?
     let desktopSize: CGSize
     let inputManager: InputManager
+    let keyboardToggleCount: Int
 
     func makeUIView(context: Context) -> RemoteDesktopUIView {
         let view = RemoteDesktopUIView(frame: .zero)
@@ -20,6 +21,11 @@ struct RemoteDesktopView: UIViewRepresentable {
     func updateUIView(_ uiView: RemoteDesktopUIView, context: Context) {
         uiView.desktopImage = desktopImage
         uiView.desktopSize = desktopSize
+
+        if keyboardToggleCount != context.coordinator.lastKeyboardToggleCount {
+            context.coordinator.lastKeyboardToggleCount = keyboardToggleCount
+            uiView.toggleVirtualKeyboard()
+        }
     }
 
     func makeCoordinator() -> Coordinator {
@@ -28,6 +34,7 @@ struct RemoteDesktopView: UIViewRepresentable {
 
     class Coordinator: NSObject, RemoteDesktopUIViewDelegate {
         let inputManager: InputManager
+        var lastKeyboardToggleCount = 0
 
         init(inputManager: InputManager) {
             self.inputManager = inputManager
@@ -39,6 +46,14 @@ struct RemoteDesktopView: UIViewRepresentable {
 
         func remoteDesktopView(_ view: RemoteDesktopUIView, keyUp key: UIKey) {
             inputManager.keyUp(key)
+        }
+
+        func remoteDesktopView(_ view: RemoteDesktopUIView, didInsertText text: String) {
+            inputManager.sendText(text)
+        }
+
+        func remoteDesktopViewDidDeleteBackward(_ view: RemoteDesktopUIView) {
+            inputManager.sendBackspace()
         }
 
         func remoteDesktopView(_ view: RemoteDesktopUIView, pointerMovedTo desktopPoint: CGPoint) {
