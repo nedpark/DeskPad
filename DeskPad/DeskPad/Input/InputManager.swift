@@ -64,16 +64,18 @@ final class InputManager {
     }
 
     func scrollWheel(deltaY: CGFloat) {
-        // VNC scroll: button 4 (scroll up) and button 5 (scroll down)
-        if deltaY < 0 {
-            buttonMask |= (1 << 3) // button 4 = scroll up
+        guard deltaY != 0 else { return }
+
+        // VNC scroll: button 4 (scroll up) and button 5 (scroll down).
+        // Scale the number of scroll steps proportionally to the delta so that
+        // both small trackpad movements and large mouse wheel ticks feel natural.
+        let scrollButton: UInt8 = deltaY < 0 ? (1 << 3) : (1 << 4)
+        let steps = max(1, min(Int(abs(deltaY) / 20), 10))
+
+        for _ in 0..<steps {
+            buttonMask |= scrollButton
             sendPointerEvent()
-            buttonMask &= ~(1 << 3)
-            sendPointerEvent()
-        } else if deltaY > 0 {
-            buttonMask |= (1 << 4) // button 5 = scroll down
-            sendPointerEvent()
-            buttonMask &= ~(1 << 4)
+            buttonMask &= ~scrollButton
             sendPointerEvent()
         }
     }

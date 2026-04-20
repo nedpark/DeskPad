@@ -31,6 +31,9 @@ final class RemoteDesktopUIView: UIView {
     private var wantsVirtualKeyboard = false
     private static let emptyInputView = UIView(frame: .zero)
 
+    /// Recognizer for trackpad/mouse scroll events (used by gesture delegate)
+    private var indirectScrollRecognizer: UIGestureRecognizer?
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
@@ -146,17 +149,27 @@ final class RemoteDesktopUIView: UIView {
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch))
         addGestureRecognizer(pinch)
 
-        // Two-finger pan for scroll
-        let scroll = UIPanGestureRecognizer(target: self, action: #selector(handleScroll))
-        scroll.minimumNumberOfTouches = 2
-        scroll.maximumNumberOfTouches = 2
-        scroll.allowedScrollTypesMask = .continuous
-        addGestureRecognizer(scroll)
+        // Two-finger touch scroll (direct touch only)
+        let touchScroll = UIPanGestureRecognizer(target: self, action: #selector(handleScroll))
+        touchScroll.minimumNumberOfTouches = 2
+        touchScroll.maximumNumberOfTouches = 2
+        addGestureRecognizer(touchScroll)
+
+        // Trackpad/mouse scroll (indirect scroll events)
+        let indirectScroll = UIPanGestureRecognizer(target: self, action: #selector(handleScroll))
+        indirectScroll.allowedScrollTypesMask = [.continuous, .discrete]
+        indirectScroll.delegate = self
+        self.indirectScrollRecognizer = indirectScroll
+        addGestureRecognizer(indirectScroll)
 
         // Single finger drag for pointer movement (touch)
         let drag = UIPanGestureRecognizer(target: self, action: #selector(handleDrag))
         drag.minimumNumberOfTouches = 1
         drag.maximumNumberOfTouches = 1
+        // Ensure taps are recognized as clicks before drag can begin.
+        // Without this, slight finger movement during a tap triggers the pan
+        // gesture, which sends a drag sequence instead of a clean click.
+        drag.require(toFail: tap)
         addGestureRecognizer(drag)
     }
 
@@ -176,6 +189,10 @@ final class RemoteDesktopUIView: UIView {
             becomeFirstResponder()
         }
         
+        // Move cursor to tap position first so the server registers the location,
+        // then send the click. This is important for macOS login screen and other
+        // UI elements that require cursor presence before responding to clicks.
+        delegate?.remoteDesktopView(self, pointerMovedTo: desktopPoint)
         delegate?.remoteDesktopView(self, mouseDown: 0, at: desktopPoint)
         delegate?.remoteDesktopView(self, mouseUp: 0, at: desktopPoint)
     }
@@ -284,6 +301,27 @@ final class RemoteDesktopUIView: UIView {
         if !unhandledPresses.isEmpty {
             super.pressesCancelled(unhandledPresses, with: event)
         }
+    }
+}
+
+// MARK: - UIGestureRecognizerDelegate
+
+extension RemoteDesktopUIView: UIGestureRecognizerDelegate {
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        // Prevent the indirect scroll recognizer from responding to direct touches.
+        // Scroll events (trackpad/mouse) bypass this method and are still handled.
+        if gestureRecognizer === indirectScrollRecognizer {
+            return false
+        }
+        return true
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        // Allow indirect scroll to coexist with other recognizers (e.g. hover)
+        if gestureRecognizer === indirectScrollRecognizer {
+            return true
+        }
+        return false
     }
 }
 
