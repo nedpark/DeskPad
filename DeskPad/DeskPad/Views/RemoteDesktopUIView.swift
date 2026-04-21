@@ -1,5 +1,28 @@
 import UIKit
 
+// MARK: - Text Input Helpers
+
+/// Minimal UITextPosition subclass for UITextInput conformance.
+private class SimpleTextPosition: UITextPosition {
+    let index: Int
+    init(_ index: Int) { self.index = index }
+}
+
+/// Minimal UITextRange subclass for UITextInput conformance.
+private class SimpleTextRange: UITextRange {
+    private let _start: SimpleTextPosition
+    private let _end: SimpleTextPosition
+
+    override var start: UITextPosition { _start }
+    override var end: UITextPosition { _end }
+    override var isEmpty: Bool { _start.index >= _end.index }
+
+    init(start: Int, end: Int) {
+        _start = SimpleTextPosition(start)
+        _end = SimpleTextPosition(end)
+    }
+}
+
 protocol RemoteDesktopUIViewDelegate: AnyObject {
     func remoteDesktopView(_ view: RemoteDesktopUIView, keyDown key: UIKey)
     func remoteDesktopView(_ view: RemoteDesktopUIView, keyUp key: UIKey)
@@ -30,6 +53,11 @@ final class RemoteDesktopUIView: UIView {
     // Virtual keyboard state
     private var wantsVirtualKeyboard = false
     private static let emptyInputView = UIView(frame: .zero)
+
+    // IME composition state (UITextInput)
+    private var _markedText: String?
+    private weak var _inputDelegate: (any UITextInputDelegate)?
+    private lazy var _tokenizer: UITextInputStringTokenizer = UITextInputStringTokenizer(textInput: self)
 
     /// Recognizer for trackpad/mouse scroll events (used by gesture delegate)
     private var indirectScrollRecognizer: UIGestureRecognizer?
@@ -257,6 +285,12 @@ final class RemoteDesktopUIView: UIView {
                 continue
             }
             if shouldDirectlyHandle(key) {
+                // Commit any in-progress IME composition (e.g. Korean syllable)
+                // before sending the key directly to VNC, so composed text is
+                // not lost when Space, Return, arrows, etc. are pressed.
+                if _markedText != nil {
+                    unmarkText()
+                }
                 delegate?.remoteDesktopView(self, keyDown: key)
             } else {
                 unhandledPresses.insert(press)
@@ -325,19 +359,161 @@ extension RemoteDesktopUIView: UIGestureRecognizerDelegate {
     }
 }
 
-// MARK: - UIKeyInput (Virtual Keyboard)
+// MARK: - UITextInput (Keyboard & IME)
 
-extension RemoteDesktopUIView: UIKeyInput {
+extension RemoteDesktopUIView: UITextInput {
+
+    // MARK: UIKeyInput
 
     var hasText: Bool { true }
 
     func insertText(_ text: String) {
+        _inputDelegate?.textWillChange(self)
+        _markedText = nil
+        _inputDelegate?.textDidChange(self)
         delegate?.remoteDesktopView(self, didInsertText: text)
     }
 
     func deleteBackward() {
+        if _markedText != nil {
+            // Composition in progress — clear it without sending backspace,
+            // because the marked text was never sent to VNC.
+            _inputDelegate?.textWillChange(self)
+            _markedText = nil
+            _inputDelegate?.textDidChange(self)
+            return
+        }
         delegate?.remoteDesktopViewDidDeleteBackward(self)
     }
+
+    // MARK: Marked Text (IME Composition)
+
+    func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
+        _inputDelegate?.textWillChange(self)
+        _markedText = markedText
+        _inputDelegate?.textDidChange(self)
+    }
+
+    func unmarkText() {
+        guard let text = _markedText, !text.isEmpty else {
+            _markedText = nil
+            return
+        }
+        _inputDelegate?.textWillChange(self)
+        _markedText = nil
+        _inputDelegate?.textDidChange(self)
+        // Commit the composed text to VNC
+        delegate?.remoteDesktopView(self, didInsertText: text)
+    }
+
+    var markedTextRange: UITextRange? {
+        guard let marked = _markedText, !marked.isEmpty else { return nil }
+        return SimpleTextRange(start: 0, end: marked.count)
+    }
+
+    var markedTextStyle: [NSAttributedString.Key: Any]? {
+        get { nil }
+        set {}
+    }
+
+    // MARK: Selection & Document Positions
+
+    var selectedTextRange: UITextRange? {
+        get {
+            let pos = _markedText?.count ?? 0
+            return SimpleTextRange(start: pos, end: pos)
+        }
+        set {}
+    }
+
+    var beginningOfDocument: UITextPosition { SimpleTextPosition(0) }
+
+    var endOfDocument: UITextPosition { SimpleTextPosition(_markedText?.count ?? 0) }
+
+    // MARK: Text & Range Queries
+
+    func text(in range: UITextRange) -> String? {
+        guard let start = range.start as? SimpleTextPosition,
+              let end = range.end as? SimpleTextPosition,
+              let marked = _markedText else { return nil }
+        let s = marked.index(marked.startIndex, offsetBy: min(start.index, marked.count))
+        let e = marked.index(marked.startIndex, offsetBy: min(end.index, marked.count))
+        return String(marked[s..<e])
+    }
+
+    func replace(_ range: UITextRange, withText text: String) {
+        // Not needed — we don't maintain editable text
+    }
+
+    func textRange(from fromPosition: UITextPosition, to toPosition: UITextPosition) -> UITextRange? {
+        guard let from = fromPosition as? SimpleTextPosition,
+              let to = toPosition as? SimpleTextPosition else { return nil }
+        return SimpleTextRange(start: from.index, end: to.index)
+    }
+
+    func position(from position: UITextPosition, offset: Int) -> UITextPosition? {
+        guard let pos = position as? SimpleTextPosition else { return nil }
+        let newIndex = pos.index + offset
+        guard newIndex >= 0 else { return nil }
+        return SimpleTextPosition(newIndex)
+    }
+
+    func position(from position: UITextPosition, in direction: UITextLayoutDirection, offset: Int) -> UITextPosition? {
+        self.position(from: position, offset: (direction == .left || direction == .up) ? -offset : offset)
+    }
+
+    func compare(_ position: UITextPosition, to other: UITextPosition) -> ComparisonResult {
+        guard let a = position as? SimpleTextPosition,
+              let b = other as? SimpleTextPosition else { return .orderedSame }
+        if a.index < b.index { return .orderedAscending }
+        if a.index > b.index { return .orderedDescending }
+        return .orderedSame
+    }
+
+    func offset(from: UITextPosition, to toPosition: UITextPosition) -> Int {
+        guard let a = from as? SimpleTextPosition,
+              let b = toPosition as? SimpleTextPosition else { return 0 }
+        return b.index - a.index
+    }
+
+    // MARK: Input Delegate & Tokenizer
+
+    var inputDelegate: (any UITextInputDelegate)? {
+        get { _inputDelegate }
+        set { _inputDelegate = newValue }
+    }
+
+    var tokenizer: any UITextInputTokenizer { _tokenizer }
+
+    // MARK: Layout & Geometry (stubs)
+
+    func position(within range: UITextRange, farthestIn direction: UITextLayoutDirection) -> UITextPosition? {
+        guard let r = range as? SimpleTextRange else { return nil }
+        return (direction == .left || direction == .up) ? r.start : r.end
+    }
+
+    func characterRange(byExtending position: UITextPosition, in direction: UITextLayoutDirection) -> UITextRange? {
+        guard let pos = position as? SimpleTextPosition else { return nil }
+        return SimpleTextRange(start: pos.index, end: pos.index)
+    }
+
+    func baseWritingDirection(for position: UITextPosition, in direction: UITextStorageDirection) -> NSWritingDirection {
+        .leftToRight
+    }
+
+    func setBaseWritingDirection(_ writingDirection: NSWritingDirection, for range: UITextRange) {}
+
+    func firstRect(for range: UITextRange) -> CGRect { .zero }
+
+    func caretRect(for position: UITextPosition) -> CGRect { .zero }
+
+    func selectionRects(for range: UITextRange) -> [UITextSelectionRect] { [] }
+
+    func closestPosition(to point: CGPoint) -> UITextPosition? { SimpleTextPosition(0) }
+
+    func closestPosition(to point: CGPoint, within range: UITextRange) -> UITextPosition? { range.start }
+
+    func characterRange(at point: CGPoint) -> UITextRange? { nil }
 
     // MARK: UITextInputTraits
 

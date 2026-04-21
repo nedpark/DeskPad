@@ -96,7 +96,10 @@ enum KeySymMapping {
         case .keyboardRightAlt:      return 0xFFEA // XK_Alt_R
         case .keyboardLeftGUI:       return 0xFFEB // XK_Super_L (Cmd)
         case .keyboardRightGUI:      return 0xFFEC // XK_Super_R
-        case .keyboardCapsLock:      return 0xFFE5 // XK_Caps_Lock
+        // Caps Lock is intentionally excluded: iPadOS uses it for local input
+        // method switching (Korean ↔ English). All IME composition happens on
+        // the iPad via UITextInput, so the remote should stay in its default
+        // input mode. Sending Caps Lock to VNC would cause double-switching.
         default: return nil
         }
     }
