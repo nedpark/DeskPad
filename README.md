@@ -12,13 +12,13 @@ It implements core parts of the RFB protocol to connect to remote desktops and i
 ## Screenshots
 
 <p align="left">
-	<img src="ScreenShot_001.png" alt="DeskPad Screenshot 1" width="320" />
-	<img src="ScreenShot_002.png" alt="DeskPad Screenshot 2" width="320" />
+	<img src="ScreenShot_003.png" alt="DeskPad Screenshot 3" width="640" />
 </p>
 
 ## Features
 - VNC connection flow with RFB handshaking and session setup
 - Password-based VNC authentication (including DES challenge response)
+- Saved connections with thumbnail previews for quick reconnection
 - Framebuffer rendering for remote desktop updates
 - Remote input forwarding:
 	- Keyboard key down/up events
@@ -35,6 +35,7 @@ It implements core parts of the RFB protocol to connect to remote desktops and i
 - CommonCrypto
 
 ## Project Structure
+- `DeskPad/Models`: Data models for connections, pixel formats, and RFB types
 - `DeskPad/Network`: VNC connection lifecycle and socket communication
 - `DeskPad/Protocol`: RFB message encoder/decoder and authentication helpers
 - `DeskPad/Framebuffer`: Pixel buffer and image generation for rendering
