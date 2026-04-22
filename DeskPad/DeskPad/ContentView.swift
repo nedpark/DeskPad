@@ -2,15 +2,24 @@ import SwiftUI
 
 struct ContentView: View {
     var connection: VNCConnection
+    var store: ConnectionStore
     @State private var inputManager: InputManager?
     @State private var keyboardToggleCount = 0
+    @State private var activeConnectionID: UUID?
 
     var body: some View {
         ZStack {
             switch connection.state {
             case .disconnected:
-                ConnectionView { host, port, username, password in
-                    connection.connect(host: host, port: port, username: username, password: password)
+                ConnectionListView(store: store) { savedConnection in
+                    activeConnectionID = savedConnection.id
+                    store.markConnected(id: savedConnection.id)
+                    connection.connect(
+                        host: savedConnection.host,
+                        port: savedConnection.port,
+                        username: savedConnection.username,
+                        password: savedConnection.password
+                    )
                 }
 
             case .connecting, .handshaking, .authenticating, .initializing:
@@ -30,6 +39,17 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Disconnect with Screenshot Capture
+
+    private func disconnectAndCapture() {
+        if let image = connection.framebufferImage,
+           let connectionID = activeConnectionID {
+            store.saveThumbnail(image, for: connectionID)
+        }
+        activeConnectionID = nil
+        connection.disconnect()
+    }
+
     // MARK: - Connecting View
 
     private var connectingView: some View {
@@ -46,7 +66,7 @@ struct ContentView: View {
             }
 
             Button("Cancel", role: .cancel) {
-                connection.disconnect()
+                disconnectAndCapture()
             }
             .buttonStyle(.bordered)
             .padding(.top, 8)
@@ -87,7 +107,7 @@ struct ContentView: View {
 
             SessionToolbar(
                 desktopName: connection.desktopName,
-                onDisconnect: { connection.disconnect() },
+                onDisconnect: { disconnectAndCapture() },
                 onToggleKeyboard: { keyboardToggleCount += 1 }
             )
         }
@@ -121,7 +141,7 @@ struct ContentView: View {
                     .multilineTextAlignment(.leading)
                 Spacer()
                 Button {
-                    connection.disconnect()
+                    disconnectAndCapture()
                 } label: {
                     Text("Disconnect")
                         .font(.caption)
@@ -154,7 +174,7 @@ struct ContentView: View {
                 .padding(.horizontal, 40)
 
             Button("Try Again") {
-                connection.disconnect()
+                disconnectAndCapture()
             }
             .buttonStyle(.borderedProminent)
             .padding(.top, 8)

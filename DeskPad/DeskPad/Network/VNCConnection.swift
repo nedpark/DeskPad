@@ -334,6 +334,11 @@ final class VNCConnection {
             width: fbWidth, height: fbHeight
         ))
 
+        // Send initial input events to wake the remote display.
+        // macOS screensaver/lock screen requires user interaction to reveal
+        // the login window and password field.
+        sendWakeEvents()
+
         state = .connected
 
         // Start timeout for initial framebuffer update
@@ -347,6 +352,21 @@ final class VNCConnection {
 
         // Start the receive loop
         startReceiveLoop()
+    }
+
+    /// Send initial input events to wake a sleeping display or screensaver.
+    /// A pointer move followed by a click at the screen center dismisses the
+    /// macOS screensaver and focuses the login password field.
+    private func sendWakeEvents() {
+        let centerX = fbWidth / 2
+        let centerY = fbHeight / 2
+
+        // Move pointer to center of screen
+        sendData(RFBMessageEncoder.encodePointerEvent(buttonMask: 0, x: centerX, y: centerY))
+
+        // Click to dismiss screensaver and/or focus the password field
+        sendData(RFBMessageEncoder.encodePointerEvent(buttonMask: 1, x: centerX, y: centerY))
+        sendData(RFBMessageEncoder.encodePointerEvent(buttonMask: 0, x: centerX, y: centerY))
     }
 
     // MARK: - Receive Loop
@@ -423,11 +443,12 @@ final class VNCConnection {
     private func handleServerMessage(_ message: ServerMessage) {
         switch message {
         case .framebufferUpdate(let rectangles):
-            applyRectangles(rectangles)
+            let desktopSizeChanged = applyRectangles(rectangles)
 
-            // Request next incremental update
+            // After a desktop size change, request a full (non-incremental)
+            // update to get the new screen contents.
             sendData(RFBMessageEncoder.encodeFramebufferUpdateRequest(
-                incremental: true,
+                incremental: !desktopSizeChanged,
                 x: 0, y: 0,
                 width: fbWidth, height: fbHeight
             ))
@@ -445,9 +466,12 @@ final class VNCConnection {
         }
     }
 
-    private func applyRectangles(_ rectangles: [RFBRectangle]) {
-        guard let framebuffer else { return }
-        guard !rectangles.isEmpty else { return }
+    /// Apply received rectangles to the framebuffer.
+    /// Returns `true` if a desktopSize pseudo-encoding was received
+    /// (the caller should request a full non-incremental update).
+    @discardableResult
+    private func applyRectangles(_ rectangles: [RFBRectangle]) -> Bool {
+        guard !rectangles.isEmpty else { return false }
 
         if !hasReceivedFirstFrame {
             hasReceivedFirstFrame = true
@@ -455,6 +479,24 @@ final class VNCConnection {
             framebufferTimeoutTask = nil
             framebufferWarning = nil
         }
+
+        // Check for desktopSize pseudo-encoding first.
+        // When the remote desktop resizes (e.g. login → desktop transition),
+        // we must recreate the framebuffer before applying any pixel data.
+        for rect in rectangles where rect.encodingType == .desktopSize {
+            let newWidth = rect.width
+            let newHeight = rect.height
+            if newWidth > 0 && newHeight > 0 && (newWidth != fbWidth || newHeight != fbHeight) {
+                fbWidth = newWidth
+                fbHeight = newHeight
+                desktopSize = CGSize(width: CGFloat(fbWidth), height: CGFloat(fbHeight))
+                framebuffer = Framebuffer(width: Int(fbWidth), height: Int(fbHeight))
+                framebufferImage = framebuffer?.createImage()
+                return true
+            }
+        }
+
+        guard let framebuffer else { return false }
 
         for rect in rectangles {
             switch rect.encodingType {
@@ -482,6 +524,7 @@ final class VNCConnection {
         }
 
         framebufferImage = framebuffer.createImage()
+        return false
     }
 
     // MARK: - Network Helpers
