@@ -74,11 +74,30 @@ final class RemoteDesktopUIView: UIView {
         diagnosticCallbackCount += 1
         VNCControlDiagnostics.logger.notice("ui callback kind=\(kind, privacy: .public) count=\(self.diagnosticCallbackCount)")
     }
+    private func recordCompositionCallback(_ kind: String, text: String?) {
+        recordInputCallback(kind)
+        let utf16Length = text?.utf16.count ?? 0
+        let scalarCount = text?.unicodeScalars.count ?? 0
+        let asciiCount = text?.unicodeScalars.filter { $0.isASCII }.count ?? 0
+        let nonASCIICount = scalarCount - asciiCount
+        let language = textInputMode?.primaryLanguage ?? "unknown"
+        VNCControlDiagnostics.logger.notice("ui composition kind=\(kind, privacy: .public) utf16_length=\(utf16Length) ascii_scalars=\(asciiCount) nonascii_scalars=\(nonASCIICount) input_language=\(language, privacy: .public)")
+    }
     #endif
 
     var onKey: ((UInt32, Bool) -> Void)?
     var onPointer: ((CGPoint, UInt8) -> Void)?
     var onFocusChanged: ((Bool) -> Void)?
+    var onInputLanguageChanged: ((String?) -> Void)?
+    @objc private func inputLanguageDidChange() {
+        guard isFirstResponder else { return }
+        onInputLanguageChanged?(textInputMode?.primaryLanguage)
+    }
+    private func observeInputLanguage() {
+        NotificationCenter.default.addObserver(self, selector: #selector(inputLanguageDidChange),
+            name: UITextInputMode.currentInputModeDidChangeNotification, object: nil)
+    }
+    deinit { NotificationCenter.default.removeObserver(self) }
     private var pressedKeys: [UIKeyboardHIDUsage: UInt32] = [:]
     private var pointerMask: UInt8 = 0
     private var pointerPoint: CGPoint = .zero
@@ -126,7 +145,8 @@ final class RemoteDesktopUIView: UIView {
     func keyDown(code: UIKeyboardHIDUsage, keysym: UInt32) {
         // Commit before a shortcut modifier reaches the server, while Shift remains
         // available to the local IME for composing shifted characters.
-        if _markedText != nil, code != .keyboardLeftShift, code != .keyboardRightShift {
+        // Hardware Korean retains UIKit context even when markedText is nil.
+        if code != .keyboardLeftShift, code != .keyboardRightShift {
             unmarkText()
         }
         pressedKeys[code] = keysym; onKey?(keysym, true)
@@ -137,7 +157,11 @@ final class RemoteDesktopUIView: UIView {
             onKey?(key, true); onKey?(key, false)
         }
     }
-    private func pointer(_ point: CGPoint, mask: UInt8? = nil) {
+    func pointer(_ point: CGPoint, mask: UInt8? = nil) {
+        // A new physical button press changes the remote caret; hover and wheel do not.
+        if let mask, mask & 0x07 & ~pointerMask != 0 {
+            unmarkText()
+        }
         pointerPoint = point
         if let mask { pointerMask = mask }
         hasPointerPosition = true
@@ -148,12 +172,12 @@ final class RemoteDesktopUIView: UIView {
         releaseAllKeys()
         wantsVirtualKeyboard = false
         let result = super.resignFirstResponder()
-        if result { onFocusChanged?(false) }
+        if result { onFocusChanged?(false); onInputLanguageChanged?(nil) }
         return result
     }
     override func becomeFirstResponder() -> Bool {
         let result = super.becomeFirstResponder()
-        if result { onFocusChanged?(wantsVirtualKeyboard) }
+        if result { onFocusChanged?(wantsVirtualKeyboard); inputLanguageDidChange() }
         return result
     }
 
@@ -191,6 +215,7 @@ final class RemoteDesktopUIView: UIView {
         isMultipleTouchEnabled = true
         setupPointerMarker()
         setupGestureRecognizers()
+        observeInputLanguage()
     }
 
     required init?(coder: NSCoder) {
@@ -199,6 +224,7 @@ final class RemoteDesktopUIView: UIView {
         isMultipleTouchEnabled = true
         setupPointerMarker()
         setupGestureRecognizers()
+        observeInputLanguage()
     }
 
     override var canBecomeFirstResponder: Bool { true }
@@ -568,7 +594,12 @@ final class RemoteDesktopUIView: UIView {
     /// are handled directly. Printable characters without command modifiers are
     /// routed through the text input system so that IME composition (Korean, etc.) works.
     func handlesDirectly(code: UIKeyboardHIDUsage, modifiers: UIKeyModifierFlags) -> Bool {
-        if code == .keyboardDeleteOrBackspace, _markedText != nil { return false }
+        // Hardware Korean composition can use insert/delete callbacks without marked text.
+        // Let UIKit decompose the active syllable before forwarding its replacement.
+        if code == .keyboardDeleteOrBackspace,
+           _markedText != nil || modifiers.intersection([.control, .alternate, .command]).isEmpty {
+            return false
+        }
         return Self.keysym(for: code) != nil || !modifiers.intersection([.control, .alternate, .command]).isEmpty
     }
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -588,20 +619,34 @@ final class RemoteDesktopUIView: UIView {
             let symbol = Self.keysym(for: key.keyCode) ?? key.charactersIgnoringModifiers.unicodeScalars.first.map { $0.value <= 255 ? $0.value : 0x01000000 | $0.value }
             guard let symbol else { unhandled.insert(press); continue }
             keyDown(code: key.keyCode, keysym: symbol)
+            // UIKit owns printable text/IME, so it must see both Shift edges.
+            // Also retain remote Shift for selection and modified shortcuts.
+            if Self.isShift(key.keyCode) { unhandled.insert(press) }
         }
         if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
     }
     override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        var unhandled = Set<UIPress>()
-        for press in presses {
-            if let code = press.key?.keyCode, let symbol = pressedKeys.removeValue(forKey: code) { onKey?(symbol, false) }
-            else { unhandled.insert(press) }
-        }
+        let unhandled = releaseHardwarePresses(presses)
         if !unhandled.isEmpty { super.pressesEnded(unhandled, with: event) }
     }
     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        pressesEnded(presses, with: event)
+        let unhandled = releaseHardwarePresses(presses)
+        if !unhandled.isEmpty { super.pressesCancelled(unhandled, with: event) }
     }
+    private func releaseHardwarePresses(_ presses: Set<UIPress>) -> Set<UIPress> {
+        var unhandled = Set<UIPress>()
+        for press in presses {
+            if let code = press.key?.keyCode, let symbol = pressedKeys.removeValue(forKey: code) {
+                onKey?(symbol, false)
+                if Self.isShift(code) { unhandled.insert(press) }
+            } else { unhandled.insert(press) }
+        }
+        return unhandled
+    }
+    private static func isShift(_ code: UIKeyboardHIDUsage) -> Bool {
+        code == .keyboardLeftShift || code == .keyboardRightShift
+    }
+
     private static func keysym(for code: UIKeyboardHIDUsage) -> UInt32? {
         switch code {
         case .keyboardLeftControl: return 0xffe3
@@ -677,8 +722,9 @@ extension RemoteDesktopUIView: UITextInput {
     }
 
     func insertText(_ text: String) {
+        inputLanguageDidChange()
         #if DEBUG
-        recordInputCallback("insertText")
+        recordCompositionCallback("insertText", text: text)
         #endif
         updateComposition(nil, selection: NSRange(location: 0, length: 0))
         sendText(text)
@@ -701,10 +747,17 @@ extension RemoteDesktopUIView: UITextInput {
     // MARK: Marked Text (IME Composition)
 
     func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
+        inputLanguageDidChange()
+        #if DEBUG
+        recordCompositionCallback("setMarkedText", text: markedText)
+        #endif
         updateComposition(markedText, selection: selectedRange)
     }
 
     func unmarkText() {
+        #if DEBUG
+        recordCompositionCallback("unmarkText", text: _markedText)
+        #endif
         let text = _markedText
         updateComposition(nil, selection: NSRange(location: 0, length: 0))
         if let text, !text.isEmpty {

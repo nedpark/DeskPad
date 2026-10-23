@@ -11,6 +11,7 @@ var receiver=try HighPerformanceSRTPReceiver(masterKeyBlob:blob)
 for packet in packets.prefix(5) { let result=try receiver.receive(packet); check(result.payload == expected,"decrypt and wrap/reorder") }
 func rejects(_ packet:Data, receiver:inout HighPerformanceSRTPReceiver) { do { _=try receiver.receive(packet); fatalError("accepted invalid/replayed packet") } catch {} }
 rejects(packets[4],receiver:&receiver)
+let recovered = try receiver.receive(packets[5]); check(recovered.payload == expected, "recover beyond former 64 packet window")
 rejects(packets[5],receiver:&receiver)
 let another=try receiver.receive(packets[6]); check(another.ssrc == 123 && another.payload == expected,"independent SSRC and extension")
 var clean=try HighPerformanceSRTPReceiver(masterKeyBlob:blob)
@@ -63,3 +64,27 @@ do { _ = try exhaustedControl.protect(rr); fatalError("SRTCP index reused") } ca
 do { _ = try rrSender.protect(sr); fatalError("wrong sender SSRC accepted") } catch {}
 do { _ = try heartbeatSender.protect(payload: Data(), payloadType: 128, timestamp: 0); fatalError("invalid PT accepted") } catch {}
 print("SRTP/SRTCP sender: independent vectors, rollover, heartbeat, RR roundtrip, exhaustion passed")
+
+let recoverySender = try HighPerformanceSRTPSender(masterKeyBlob: blob, ssrc: 456, initialSequence: 65000)
+var recoveryPackets: [Data] = []
+for i in 0...5200 { recoveryPackets.append(try recoverySender.protect(payload: expected, payloadType: 100, timestamp: UInt32(i))) }
+var recoveryReceiver = try HighPerformanceSRTPReceiver(masterKeyBlob: blob)
+_ = try recoveryReceiver.receive(recoveryPackets[0])
+_ = try recoveryReceiver.receive(recoveryPackets[1000]) // Cross ROC before a large forward jump.
+var forgedFuture = recoveryPackets[5000]; forgedFuture[forgedFuture.count - 1] ^= 1
+rejects(forgedFuture, receiver: &recoveryReceiver)
+_ = try recoveryReceiver.receive(recoveryPackets[1]) // Forged future did not shift the window.
+_ = try recoveryReceiver.receive(recoveryPackets[5000])
+for offset in [268, 4095, 64, 63, 65] {
+    let packet = recoveryPackets[5000 - offset]
+    _ = try recoveryReceiver.receive(packet)
+    rejects(packet, receiver: &recoveryReceiver)
+}
+rejects(recoveryPackets[904], receiver: &recoveryReceiver) // Exactly 4096 old.
+rejects(recoveryPackets[1], receiver: &recoveryReceiver)
+for newest in [5001, 5065, 5130, 5200] {
+    _ = try recoveryReceiver.receive(recoveryPackets[newest])
+    rejects(recoveryPackets[5000 - 268], receiver: &recoveryReceiver)
+    rejects(recoveryPackets[5000], receiver: &recoveryReceiver)
+}
+print("SRTP 4096: NACK recovery, word boundaries, old ROC, duplicate, expiry and forged-future isolation passed")

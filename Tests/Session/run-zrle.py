@@ -112,5 +112,5 @@ cases.append(dict(name='6K-noisy-raw-tiles',rectangles=[dict(width=w,height=h,co
 del encoded,expected,payload
 fixture=work/'fixtures.json'; fixture.write_text(json.dumps(cases))
 binary=work/'zrle-tests'
-subprocess.run(['swiftc']+([] if '--debug' in sys.argv else ['-O'])+['-parse-as-library',str(root/'DeskPad/RFBZRLEDecoder.swift'),str(root/'Tests/Session/ZRLEHarness.swift'),'-o',str(binary)],check=True)
+subprocess.run(['swiftc']+([] if '--debug' in sys.argv else ['-O'])+['-parse-as-library',str(root/'DeskPad/VNC/RFBZRLEDecoder.swift'),str(root/'Tests/Session/ZRLEHarness.swift'),'-o',str(binary)],check=True)
 subprocess.run([str(binary),str(fixture)],check=True,timeout=60)

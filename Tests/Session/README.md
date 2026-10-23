@@ -43,7 +43,7 @@ XCursor updates without republishing the framebuffer, and disconnect cleanup.
 The decoder fixture can be run separately:
 
 ```sh
-swiftc -parse-as-library DeskPad/RFBZRLEDecoder.swift DeskPad/RFBCursorShape.swift Tests/Session/CursorHarness.swift -o /tmp/deskpad-cursor-tests
+swiftc -parse-as-library DeskPad/VNC/RFBZRLEDecoder.swift DeskPad/VNC/RFBCursorShape.swift Tests/Session/CursorHarness.swift -o /tmp/deskpad-cursor-tests
 /tmp/deskpad-cursor-tests
 ```
 

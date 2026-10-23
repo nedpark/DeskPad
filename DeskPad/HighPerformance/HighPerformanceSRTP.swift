@@ -72,7 +72,7 @@ nonisolated struct HighPerformanceSRTPReceiver {
         var plain = Data(b[..<headerLength]); plain.append(decrypted)
         let packet = try HighPerformanceRTPPacket(plain)
         // Only authenticated, structurally valid packets can change ROC/replay state.
-        var updated = window ?? SRTPReplayWindow(highest: index, bitmap: 0)
+        var updated = window ?? SRTPReplayWindow(highest: index, wordCount: 64)
         updated.accept(index)
         streams[ssrc] = updated
         acceptedPackets += 1
@@ -122,22 +122,42 @@ nonisolated private func srtpCTR(_ input: Data, key: Data, iv: [UInt8]) throws -
 }
 
 nonisolated private struct SRTPReplayWindow {
-        var highest: UInt64
-        var bitmap: UInt64
-        func check(_ index: UInt64) throws {
-            if index <= highest {
-                let age = highest - index
-                guard age < 64, bitmap & (UInt64(1) << age) == 0 else { throw HighPerformanceSRTPError.replay }
+    var highest: UInt64
+    private var words: [UInt64]
+    init(highest: UInt64, wordCount: Int) {
+        self.highest = highest
+        words = Array(repeating: 0, count: wordCount)
+    }
+    func check(_ index: UInt64) throws {
+        if index <= highest {
+            let age = highest - index
+            guard age < UInt64(words.count * 64),
+                  words[Int(age / 64)] & (UInt64(1) << (age % 64)) == 0 else {
+                throw HighPerformanceSRTPError.replay
             }
         }
-        mutating func accept(_ index: UInt64) {
-            if index > highest {
-                let jump = index - highest
-                bitmap = jump >= 64 ? 1 : (bitmap << jump) | 1
-                highest = index
-            } else { bitmap |= UInt64(1) << (highest - index) }
-        }
     }
+    mutating func accept(_ index: UInt64) {
+        if index > highest {
+            let jump = index - highest
+            if jump >= UInt64(words.count * 64) {
+                words = Array(repeating: 0, count: words.count)
+            } else {
+                let whole = Int(jump / 64), bits = Int(jump % 64)
+                // Move oldest words first so sources remain untouched.
+                for destination in stride(from: words.count - 1, through: 0, by: -1) {
+                    let source = destination - whole
+                    var shifted: UInt64 = source >= 0 ? words[source] << bits : 0
+                    if bits > 0, source > 0 { shifted |= words[source - 1] >> (64 - bits) }
+                    words[destination] = shifted
+                }
+            }
+            highest = index
+        }
+        let age = Int(highest - index)
+        words[age / 64] |= UInt64(1) << (age % 64)
+    }
+}
 
 /// SRTCP counterpart with a separate replay window and key labels 3/4/5.
 /// Returns the authenticated compound RTCP datagram with index/tag removed.
@@ -173,7 +193,7 @@ nonisolated struct HighPerformanceSRTCPReceiver {
             plain.append(try srtpCTR(body, key: keys.encryption, iv: iv))
         } else { plain.append(body) }
         _ = try HighPerformanceSenderReport.parseCompound(plain)
-        var updated = window ?? SRTPReplayWindow(highest: index, bitmap: 0)
+        var updated = window ?? SRTPReplayWindow(highest: index, wordCount: 1)
         updated.accept(index)
         streams[ssrc] = updated
         acceptedPackets += 1

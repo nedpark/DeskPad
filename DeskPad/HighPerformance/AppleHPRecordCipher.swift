@@ -49,6 +49,22 @@ nonisolated final class AppleHPRecordCipher {
         }
     }
 
+    /// Native HP pointer envelope inside the authenticated control record.
+    /// The inner ECB block uses the current post-rekey key, not the initial
+    /// authentication wrapping key. Keep that key private to this executor.
+    func encodePointer(x: UInt16, y: UInt16, buttonMask: UInt8) throws -> Data {
+        try checked {
+            guard let key else { throw Failure.inactive }
+            var event = Data(repeating: 0, count: 10)
+            event.append(0xff)
+            event.append(buttonMask)
+            event.append(contentsOf: [UInt8(x >> 8), UInt8(truncatingIfNeeded: x),
+                                      UInt8(y >> 8), UInt8(truncatingIfNeeded: y)])
+            let encryptedEvent = try Self.crypt(event, key: key, iv: nil, encrypt: true)
+            return try encode(body: Data([0x10, 0]) + encryptedEvent)
+        }
+    }
+
     func encode(body: Data) throws -> Data {
         try checked {
             guard let key else { throw Failure.inactive }

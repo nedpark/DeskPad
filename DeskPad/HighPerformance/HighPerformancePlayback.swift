@@ -2,6 +2,9 @@ import Foundation
 import AVFoundation
 import AudioToolbox
 import CoreMedia
+#if DEBUG
+import os
+#endif
 
 enum HighPerformancePlaybackError: Error {
     case invalidAccessUnit, missingConfiguration, unsupportedAudio, mediaStatus(OSStatus), backpressure, rendererFailed
@@ -10,6 +13,9 @@ enum HighPerformancePlaybackError: Error {
 /// Builds complete, authenticated access units into compressed CMSampleBuffers.
 /// No RTP depacketization is performed here. Confine to one queue/actor.
 final class HighPerformanceSampleFactory {
+    private var hevcParameters: [Int: Data] = [:]
+    private var hevcFormat: CMVideoFormatDescription?
+    var hasHEVCConfiguration: Bool { hevcFormat != nil }
     private var sps: Data?
     private var pps: Data?
     private var videoFormat: CMVideoFormatDescription?
@@ -20,7 +26,7 @@ final class HighPerformanceSampleFactory {
         return CMAudioFormatDescriptionGetStreamBasicDescription(audioFormat)?.pointee
     }
 
-    func reset() { sps = nil; pps = nil; videoFormat = nil; audioFormat = nil }
+    func reset() { hevcParameters.removeAll(); hevcFormat = nil; sps = nil; pps = nil; videoFormat = nil; audioFormat = nil }
 
     /// Wraps MPEG-4 AudioSpecificConfig in an ESDS descriptor for CoreAudio's magic cookie API.
     /// Format parameters are obtained from CoreAudio, never inferred from RTP timestamps.
@@ -67,6 +73,47 @@ final class HighPerformanceSampleFactory {
             formatDescription: audioFormat, sampleCount: 1, presentationTimeStamp: CMTime(seconds: presentationSeconds, preferredTimescale: 1_000_000),
             packetDescriptions: &description, sampleBufferOut: &sample))
         guard let sample else { throw HighPerformancePlaybackError.invalidAccessUnit }
+        return sample
+    }
+
+    /// One complete HEVC AU after authenticated depacketization. Only one picture
+    /// stream is supported; callers must reject multi-SSRC tiled negotiation.
+    func hevcAccessUnit(_ units: [Data], presentationSeconds: Double) throws -> CMSampleBuffer? {
+        guard presentationSeconds.isFinite, !units.isEmpty, units.count <= 256,
+              units.reduce(0, { $0 + $1.count }) <= 8 * 1024 * 1024 else { throw HighPerformancePlaybackError.invalidAccessUnit }
+        var buffer = Data()
+        var hasPicture = false
+        for unit in units {
+            let b = [UInt8](unit.prefix(2))
+            guard unit.count >= 3, b[0] & 128 == 0, b[1] & 7 != 0 else { throw HighPerformancePlaybackError.invalidAccessUnit }
+            let type = Int((b[0] >> 1) & 63)
+            guard type < 48 else { throw HighPerformancePlaybackError.invalidAccessUnit }
+            if (32...34).contains(type) {
+                if hevcParameters[type] != unit { hevcFormat = nil; hevcParameters[type] = unit }
+            } else {
+                hasPicture = hasPicture || type < 32
+                var length = UInt32(unit.count).bigEndian
+                withUnsafeBytes(of: &length) { buffer.append(contentsOf: $0) }
+                buffer.append(unit)
+            }
+        }
+        if hevcFormat == nil, let vps = hevcParameters[32], let sps = hevcParameters[33], let pps = hevcParameters[34] {
+            try vps.withUnsafeBytes { v in try sps.withUnsafeBytes { s in try pps.withUnsafeBytes { p in
+                var pointers = [v.bindMemory(to: UInt8.self).baseAddress!, s.bindMemory(to: UInt8.self).baseAddress!, p.bindMemory(to: UInt8.self).baseAddress!]
+                var sizes = [vps.count, sps.count, pps.count]
+                try requireStatus(CMVideoFormatDescriptionCreateFromHEVCParameterSets(allocator: kCFAllocatorDefault,
+                    parameterSetCount: 3, parameterSetPointers: &pointers, parameterSetSizes: &sizes,
+                    nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &hevcFormat))
+            } } }
+        }
+        guard hasPicture else { return nil }
+        guard let hevcFormat else { throw HighPerformancePlaybackError.missingConfiguration }
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: CMTime(seconds: presentationSeconds, preferredTimescale: 1_000_000), decodeTimeStamp: .invalid)
+        var size = buffer.count
+        var sample: CMSampleBuffer?
+        try requireStatus(CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: try makeBlock(buffer),
+            formatDescription: hevcFormat, sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample))
         return sample
     }
 
@@ -123,24 +170,52 @@ final class HighPerformanceSampleFactory {
     }
 }
 
-/// Native audio and video share one playback clock. Call start only after both
-/// streams have SR-derived timestamps and initial samples. Call reset on reconnect.
+/// Native audio and video share one playback clock. Video can start with its own
+/// SR-derived timestamp; audio joins after its independent SR. Reset on reconnect.
 @MainActor final class HighPerformancePlayback {
-    let videoLayer: AVSampleBufferDisplayLayer
-    private let audioRenderer: AVSampleBufferAudioRenderer
-    private let synchronizer: AVSampleBufferRenderSynchronizer
-    private let videoReceiver: AVSampleBufferVideoRenderer.Receiver
-    private let audioReceiver: AVSampleBufferAudioRenderer.Receiver
+    let videoLayer = AVSampleBufferDisplayLayer()
+    private let audioRenderer = AVSampleBufferAudioRenderer()
+    private let synchronizer = AVSampleBufferRenderSynchronizer()
+    private var nativeVideoDecoder: HighPerformanceNativeVideoDecoder?
+    private let pcmAudio = HighPerformancePCMAudioDelivery()
+
+    #if DEBUG
+    private var diagnosticAudioEnqueues = 0
+    private var diagnosticPresentationPolls = 0
+    private var audioDiagnostic = HighPerformanceAudioDiagnostic()
+    #endif
+    /// Suspension can invalidate the renderer even while its network remains healthy.
+    /// Recreate the session instead of flushing away a predictive frame's references.
+    var needsRecovery: Bool {
+        videoLayer.sampleBufferRenderer.requiresFlushToResumeDecoding ||
+        videoLayer.sampleBufferRenderer.status == .failed || audioRenderer.status == .failed
+    }
+
+    var presentationSeconds: Double { CMTimeGetSeconds(synchronizer.currentTime()) }
+
+    /// A decoded pixel buffer actually selected for display, not merely queued RTP.
+    var hasDisplayedVideoFrame: Bool {
+        if #available(macOS 14.4, iOS 17.4, *) {
+            let displayed = videoLayer.sampleBufferRenderer.displayedPixelBuffer() != nil
+            #if DEBUG
+            diagnosticPresentationPolls += 1
+            if diagnosticPresentationPolls <= 2 || diagnosticPresentationPolls % 100 == 0 {
+                let status = videoLayer.sampleBufferRenderer.status.rawValue
+                let error = (videoLayer.sampleBufferRenderer.error as NSError?)?.code ?? 0
+                let time = presentationSeconds
+                VNCControlDiagnostics.logger.notice("HP renderer poll=\(self.diagnosticPresentationPolls) displayed=\(displayed) status=\(status) error=\(error) time=\(time) width=\(self.videoLayer.bounds.width) height=\(self.videoLayer.bounds.height)")
+            }
+            #endif
+            return displayed
+        }
+        return false
+    }
 
     init() {
-        let videoLayer = AVSampleBufferDisplayLayer()
-        let audioRenderer = AVSampleBufferAudioRenderer()
-        let synchronizer = AVSampleBufferRenderSynchronizer()
-        self.videoLayer = videoLayer
-        self.audioRenderer = audioRenderer
-        self.synchronizer = synchronizer
-        videoReceiver = synchronizer.sampleBufferReceiver(adding: videoLayer.sampleBufferRenderer)
-        audioReceiver = synchronizer.sampleBufferReceiver(adding: audioRenderer)
+        // Idle audio must not hold the shared clock at zero indefinitely.
+        synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
+        synchronizer.addRenderer(videoLayer.sampleBufferRenderer)
+        synchronizer.addRenderer(audioRenderer)
     }
 
     func start(at senderSeconds: Double, playoutDelay: Double = 0.08) throws {
@@ -154,41 +229,50 @@ final class HighPerformanceSampleFactory {
     }
 
     func enqueueVideo(_ sample: CMSampleBuffer) throws {
-        let readySample = CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(unsafeBuffer: sample)
-        switch videoReceiver.enqueueImmediately(readySample) {
-        case .enqueued:
-            break
-        case .enqueuedWithDecodeFailures(_):
-            throw HighPerformancePlaybackError.rendererFailed
-        case .cancelledDueToFlush:
-            throw HighPerformancePlaybackError.backpressure
-        case .cancelledDueToFlushRequiredToResume(_), .cancelledDueToError(_):
-            throw HighPerformancePlaybackError.rendererFailed
-        @unknown default:
-            throw HighPerformancePlaybackError.rendererFailed
+        guard videoLayer.sampleBufferRenderer.status != .failed else { throw HighPerformancePlaybackError.rendererFailed }
+        guard videoLayer.sampleBufferRenderer.isReadyForMoreMediaData else { throw HighPerformancePlaybackError.backpressure }
+        videoLayer.sampleBufferRenderer.enqueue(sample)
+    }
+
+    /// The caller must independently validate reference dependencies before ACK.
+    /// Success means native decode produced an image and the display accepted it.
+    func enqueueVideo(_ sample: CMSampleBuffer, prepare: @escaping @MainActor @Sendable () -> Bool = { true }, decodeCompletion: @escaping @MainActor @Sendable (Bool) -> Void) throws {
+        if nativeVideoDecoder == nil { nativeVideoDecoder = HighPerformanceNativeVideoDecoder() }
+        try nativeVideoDecoder!.enqueue(sample, prepare: prepare) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let decoded):
+                do { try self.enqueueVideo(decoded.sample); decodeCompletion(true) }
+                catch { decodeCompletion(false) }
+            case .failure: decodeCompletion(false)
+            }
         }
     }
 
     func enqueueAudio(_ sample: CMSampleBuffer) throws {
-        let readySample = CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(unsafeBuffer: sample)
-        switch audioReceiver.enqueueImmediately(readySample) {
-        case .enqueued:
-            break
-        case .enqueuedWithSuggestedFlush(_):
-            throw HighPerformancePlaybackError.rendererFailed
-        case .cancelledDueToFlush:
-            throw HighPerformancePlaybackError.backpressure
-        case .cancelledDueToError(_):
-            throw HighPerformancePlaybackError.rendererFailed
-        @unknown default:
-            throw HighPerformancePlaybackError.rendererFailed
+        guard audioRenderer.status != .failed else { throw HighPerformancePlaybackError.rendererFailed }
+        try pcmAudio.enqueue(sample, isReady: { audioRenderer.isReadyForMoreMediaData }, emit: { audioRenderer.enqueue($0) })
+        #if DEBUG
+        audioDiagnostic.inspect(sample, clock: presentationSeconds)
+        diagnosticAudioEnqueues += 1
+        if diagnosticAudioEnqueues <= 2 || diagnosticAudioEnqueues % 500 == 0 {
+            VNCControlDiagnostics.logger.notice("HP PCM playback enqueued=\(self.diagnosticAudioEnqueues) decoded_frames=\(self.pcmAudio.decodedFrames) concealed_frames=\(self.pcmAudio.concealedFrames) long_gaps=\(self.pcmAudio.longGaps)")
         }
+        #endif
     }
 
-    func reset() async {
+    func setMuted(_ muted: Bool) { audioRenderer.isMuted = muted }
+
+    func reset() {
+        nativeVideoDecoder?.reset()
+        pcmAudio.reset()
         synchronizer.setRate(0, time: .zero)
-        await videoReceiver.flush(removingDisplayedImage: true)
-        audioReceiver.flush()
+        videoLayer.sampleBufferRenderer.flush(removingDisplayedImage: true)
+        audioRenderer.flush()
+        #if DEBUG
+        audioDiagnostic = HighPerformanceAudioDiagnostic()
+        diagnosticAudioEnqueues = 0
+        #endif
     }
 }
 
@@ -201,3 +285,86 @@ private func makeBlock(_ data: Data) throws -> CMBlockBuffer {
     try data.withUnsafeBytes { try requireStatus(CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: data.count)) }
     return block
 }
+
+#if DEBUG
+/// Independent native decode for bounded, content-free audio acceptance metrics.
+/// This measures received PCM, not speaker output or perceived A/V synchronization.
+final class HighPerformanceAudioDiagnostic {
+    private var converter: AudioConverterRef?
+    private var packetFrames: UInt32 = 480
+    private var channels: UInt32 = 2
+    private var count = 0
+    private(set) var nonSilent = 0
+    private var maximumPeak: Float = 0
+    private(set) var decodedFrames: UInt64 = 0
+
+    func inspect(_ sample: CMSampleBuffer, clock: Double) {
+        count += 1
+        do {
+            let format = CMSampleBufferGetFormatDescription(sample)!
+            if converter == nil {
+                var source = CMAudioFormatDescriptionGetStreamBasicDescription(format)!.pointee
+                guard source.mSampleRate > 0, source.mChannelsPerFrame <= 2, source.mFramesPerPacket <= 4096 else { return }
+                channels = source.mChannelsPerFrame; packetFrames = source.mFramesPerPacket
+                var target = AudioStreamBasicDescription(mSampleRate: source.mSampleRate, mFormatID: kAudioFormatLinearPCM,
+                    mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, mBytesPerPacket: channels * 4,
+                    mFramesPerPacket: 1, mBytesPerFrame: channels * 4, mChannelsPerFrame: channels, mBitsPerChannel: 32, mReserved: 0)
+                try requireStatus(AudioConverterNew(&source, &target, &converter))
+                var size = 0
+                guard let cookie = CMAudioFormatDescriptionGetMagicCookie(format, sizeOut: &size), let converter else { return }
+                try requireStatus(AudioConverterSetProperty(converter, kAudioConverterDecompressionMagicCookie, UInt32(size), cookie))
+                VNCControlDiagnostics.logger.notice("HP audio decode profile rate=\(source.mSampleRate) channels=\(source.mChannelsPerFrame) frames_per_packet=\(source.mFramesPerPacket) codec=\(source.mFormatID)")
+            }
+            guard let converter, let block = CMSampleBufferGetDataBuffer(sample) else { return }
+            let length = CMBlockBufferGetDataLength(block)
+            guard length > 0, length <= 65535 else { return }
+            let input = Input(count: length)
+            try requireStatus(CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: input.bytes))
+            var pcm = [Float](repeating: 0, count: 4096 * Int(channels))
+            var frames: UInt32 = packetFrames
+            let status = pcm.withUnsafeMutableBytes { output -> OSStatus in
+                var buffers = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(mNumberChannels: channels, mDataByteSize: UInt32(output.count), mData: output.baseAddress))
+                return AudioConverterFillComplexBuffer(converter, { _, count, buffers, descriptions, context in
+                    let input = Unmanaged<Input>.fromOpaque(context!).takeUnretainedValue()
+                    guard !input.delivered else {
+                        // Zero packets + noErr means permanent end-of-stream.
+                        // RTP supplies another AU later; preserve decoder state.
+                        count.pointee = 0; return -12345
+                    }
+                    input.delivered = true; count.pointee = 1
+                    buffers.pointee = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(mNumberChannels: 2, mDataByteSize: UInt32(input.count), mData: input.bytes))
+                    descriptions?.pointee = input.description
+                    return noErr
+                }, Unmanaged.passUnretained(input).toOpaque(), &frames, &buffers, nil)
+            }
+            if status != -12345 { try requireStatus(status) }
+            let peak = pcm.prefix(Int(frames * channels)).reduce(Float(0)) { max($0, abs($1)) }
+            decodedFrames += UInt64(frames); maximumPeak = max(maximumPeak, peak)
+            if peak > 0.001 { nonSilent += 1 }
+            if count <= 2 || count % 100 == 0 || (peak > 0.001 && nonSilent <= 2) {
+                let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
+                VNCControlDiagnostics.logger.notice("HP audio PCM packets=\(self.count) non_silent=\(self.nonSilent) decoded_frames=\(self.decodedFrames) peak=\(self.maximumPeak) sample_pts=\(pts) playback_clock=\(clock) queued_ahead=\(pts-clock)")
+                maximumPeak = 0
+            }
+        } catch {
+            if count <= 2 || count % 100 == 0 {
+                let code = (error as NSError).code
+                VNCControlDiagnostics.logger.notice("HP audio diagnostic decode failed count=\(self.count) error=\(code)")
+            }
+        }
+    }
+    deinit { if let converter { AudioConverterDispose(converter) } }
+    private final class Input {
+        let bytes: UnsafeMutableRawPointer
+        let count: Int
+        let description: UnsafeMutablePointer<AudioStreamPacketDescription>
+        var delivered = false
+        init(count: Int) {
+            self.count = count; bytes = .allocate(byteCount: count, alignment: 1)
+            description = .allocate(capacity: 1)
+            description.initialize(to: AudioStreamPacketDescription(mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(count)))
+        }
+        deinit { bytes.deallocate(); description.deinitialize(count: 1); description.deallocate() }
+    }
+}
+#endif

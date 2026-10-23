@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Darwin
 
 /// Unconnected UDP avoids treating an early host ICMP-port-unreachable as a
@@ -11,6 +12,9 @@ nonisolated final class AppleHPUDPSocket: @unchecked Sendable {
     private var peer: sockaddr_in
     private let source: DispatchSourceRead
     private var active = true
+    private var sentPackets = 0
+    private var failedSends = 0
+    private var filteredPackets = 0
     private let receive: @Sendable (Data) -> Void
 
     static func resolveIPv4(host: String) async throws -> String {
@@ -48,7 +52,13 @@ nonisolated final class AppleHPUDPSocket: @unchecked Sendable {
         let flags = fcntl(fd, F_GETFL)
         guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else { throw Failure.system(errno) }
         var bufferSize: Int32 = 4 * 1024 * 1024
-        _ = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufferSize, socklen_t(MemoryLayout<Int32>.size))
+        let bufferStatus = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufferSize, socklen_t(MemoryLayout<Int32>.size))
+        #if DEBUG
+        var actualBuffer: Int32 = 0
+        var actualSize = socklen_t(MemoryLayout<Int32>.size)
+        _ = getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actualBuffer, &actualSize)
+        VNCControlDiagnostics.logger.notice("HP UDP receive buffer requested=4194304 actual=\(actualBuffer) status=\(bufferStatus)")
+        #endif
         var local = sockaddr_in()
         local.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         local.sin_family = sa_family_t(AF_INET); local.sin_port = (localPort ?? port).bigEndian
@@ -61,7 +71,9 @@ nonisolated final class AppleHPUDPSocket: @unchecked Sendable {
         queue.setSpecific(key: queueKey, value: 1)
         // Only the cancel handler closes an activated descriptor. Capturing the
         // numeric fd here prevents delayed cancellation closing a reused field.
-        source.setCancelHandler { Darwin.close(fd) }
+        closed.enter()
+        let closed = self.closed
+        source.setCancelHandler { Darwin.close(fd); closed.leave() }
         source.setEventHandler { [weak self] in self?.drain() }
         bound = true
         source.resume()
@@ -72,14 +84,39 @@ nonisolated final class AppleHPUDPSocket: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, self.active else { return }
             var endpoint = self.peer
-            data.withUnsafeBytes { payload in
+            let sent = data.withUnsafeBytes { payload in
                 withUnsafePointer(to: &endpoint) { address in
                     address.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                        _ = Darwin.sendto(self.descriptor, payload.baseAddress, payload.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        Darwin.sendto(self.descriptor, payload.baseAddress, payload.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
                     }
                 }
             }
+            if sent == data.count {
+                self.sentPackets += 1
+                #if DEBUG
+                if self.sentPackets == 1 || self.sentPackets % 500 == 0 {
+                    VNCControlDiagnostics.logger.notice("HP UDP sent port=\(self.peer.sin_port.bigEndian) count=\(self.sentPackets) failures=\(self.failedSends) filtered=\(self.filteredPackets)")
+                }
+                #endif
+            }
+            else {
+                let failure = errno
+                self.failedSends += 1
+                #if DEBUG
+                if self.failedSends == 1 || self.failedSends % 100 == 0 {
+                    VNCControlDiagnostics.logger.notice("HP UDP send failure port=\(self.peer.sin_port.bigEndian) errno=\(failure) failures=\(self.failedSends) sent=\(self.sentPackets)")
+                }
+                #endif
+            }
             // EAGAIN/ECONNREFUSED are transient datagram loss, never teardown.
+        }
+    }
+
+    private let closed = DispatchGroup()
+
+    func waitUntilClosed() async {
+        await withCheckedContinuation { continuation in
+            closed.notify(queue: .global()) { continuation.resume() }
         }
     }
 
@@ -109,7 +146,15 @@ nonisolated final class AppleHPUDPSocket: @unchecked Sendable {
                 return
             }
             guard length == MemoryLayout<sockaddr_in>.size, sender.sin_family == sa_family_t(AF_INET),
-                  sender.sin_addr.s_addr == peer.sin_addr.s_addr, sender.sin_port == peer.sin_port else { continue }
+                  sender.sin_addr.s_addr == peer.sin_addr.s_addr, sender.sin_port == peer.sin_port else {
+                filteredPackets += 1
+                #if DEBUG
+                if filteredPackets == 1 || filteredPackets % 100 == 0 {
+                    VNCControlDiagnostics.logger.notice("HP UDP filtered port=\(self.peer.sin_port.bigEndian) count=\(self.filteredPackets)")
+                }
+                #endif
+                continue
+            }
             receive(Data(buffer.prefix(count)))
         }
     }

@@ -6,7 +6,7 @@ Run from any directory on macOS with the Xcode command-line tools installed:
 Tests/Storage/run.sh
 ```
 
-The script compiles the actual `DeskPad/ConnectionStore.swift` with Foundation,
+The script compiles the actual `DeskPad/Connections/ConnectionStore.swift` with Foundation,
 Observation, and Security, treats compiler warnings as errors, and executes eleven
 isolated scenarios. It uses temporary JSON files, private UserDefaults suites,
 and an injected credential store; it never reads or changes real Keychain items.

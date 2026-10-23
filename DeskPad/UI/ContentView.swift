@@ -3,6 +3,7 @@ import UIKit
 import Observation
 
 struct ContentView: View {
+    @AppStorage(DeskPadConnectionMode.storageKey) private var storedConnectionMode = DeskPadConnectionMode.standard.rawValue
     @AppStorage("deskpadColorQuality") private var colorQuality = VNCColorQuality.lowLatency
     @AppStorage("deskpadScrollSensitivity") private var scrollSensitivity = RemoteScrollSensitivity.double
     @State private var store = ConnectionStore()
@@ -56,7 +57,9 @@ struct ContentView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
-                        ColorQualityPicker(selection: $colorQuality)
+                        ConnectionModeSettings()
+                            ColorQualityPicker(selection: $colorQuality)
+                                .disabled(DeskPadConnectionMode.restored(from: storedConnectionMode).usesHighPerformance)
                         Divider()
                         ScrollSensitivityPicker(selection: $scrollSensitivity)
                     } label: {
@@ -251,11 +254,13 @@ private struct ConnectionEditor: View {
 }
 
 private struct SessionView: View {
+    @AppStorage(DeskPadConnectionMode.storageKey) private var storedConnectionMode = DeskPadConnectionMode.standard.rawValue
     @AppStorage("deskpadColorQuality") private var colorQuality = VNCColorQuality.lowLatency
     @AppStorage("deskpadScrollSensitivity") private var scrollSensitivity = RemoteScrollSensitivity.double
     @Environment(\.dismiss) private var dismiss
     @State private var session = VNCSessionModel()
     @State private var keyboardController = RemoteKeyboardController()
+    @State private var didStart = false
     @Environment(\.scenePhase) private var scenePhase
     @State private var warning: UserMessage?
     @State private var password: String?
@@ -298,10 +303,10 @@ private struct SessionView: View {
                             Text(sessionDescription)
                         } actions: {
                             if session.state == .ended {
-                                Button("다시 연결") { session.connect(to: connection, password: password, colorQuality: colorQuality) }
+                                Button("다시 연결") { session.connect(to: connection, password: password, colorQuality: colorQuality, connectionMode: .restored(from: storedConnectionMode)) }
                                     .buttonStyle(.borderedProminent)
                             } else if case .failed = session.state {
-                                Button("다시 시도") { session.connect(to: connection, password: password, colorQuality: colorQuality) }
+                                Button("다시 시도") { session.connect(to: connection, password: password, colorQuality: colorQuality, connectionMode: .restored(from: storedConnectionMode)) }
                                     .buttonStyle(.borderedProminent)
                             }
                         }
@@ -323,6 +328,11 @@ private struct SessionView: View {
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     if case .connected = session.state {
+                        Text("iPad · \(keyboardController.inputLanguageLabel)")
+                            .font(.subheadline.monospacedDigit())
+                            .fixedSize(horizontal: true, vertical: false)
+                            .accessibilityLabel("iPad 입력 언어: \(keyboardController.inputLanguageLabel)")
+                            .accessibilityHint("원격 Mac의 입력 언어가 아닌 iPad 키보드의 선택 상태입니다.")
                         Button {
                             if keyboardController.isFocused {
                                 keyboardController.dismiss()
@@ -348,7 +358,9 @@ private struct SessionView: View {
                             Text("클립보드는 Latin-1 문자, 최대 1 MiB를 지원합니다.")
                         } label: { Label("클립보드", systemImage: "doc.on.clipboard") }
                         Menu {
+                            ConnectionModeSettings()
                             ColorQualityPicker(selection: $colorQuality)
+                                .disabled(DeskPadConnectionMode.restored(from: storedConnectionMode).usesHighPerformance)
                             if session.usingCompatibleColor {
                                 Text("검은 화면을 감지해 호환 색상으로 연결했습니다. 전송량이 늘어날 수 있습니다.")
                             }
@@ -374,20 +386,26 @@ private struct SessionView: View {
                 }
             }
             .task {
+                guard !didStart else { return }
+                didStart = true
                 do {
                     password = try store.password(for: connection)
-                    session.connect(to: connection, password: password, colorQuality: colorQuality)
+                    session.connect(to: connection, password: password, colorQuality: colorQuality, connectionMode: .restored(from: storedConnectionMode))
                 } catch {
                     session.reportError("저장된 VNC 암호를 읽지 못했습니다: \(error.localizedDescription)")
                 }
             }
+            .onChange(of: storedConnectionMode) { _, _ in
+                keyboardController.dismiss()
+                session.connect(to: connection, password: password, colorQuality: colorQuality, connectionMode: .restored(from: storedConnectionMode))
+            }
             .onChange(of: colorQuality) { _, _ in
                 keyboardController.dismiss()
-                session.connect(to: connection, password: password, colorQuality: colorQuality)
+                session.connect(to: connection, password: password, colorQuality: colorQuality, connectionMode: .restored(from: storedConnectionMode))
             }
             .onChange(of: session.state) { _, newState in
                 switch newState {
-                case .ended, .failed, .disconnected: keyboardController.dismiss()
+                case .ended, .failed, .disconnected, .paused, .reconnecting: keyboardController.dismiss()
                 default: break
                 }
                 if case .connected = newState {
@@ -401,12 +419,27 @@ private struct SessionView: View {
             .alert(item: $warning) { item in
                 Alert(title: Text("DeskPad"), message: Text(item.text), dismissButton: .default(Text("확인")))
             }
+            .alert("Mac 서버 신뢰 확인", isPresented: Binding(
+                get: { session.hpTrustChallenge != nil },
+                set: { if !$0 { session.answerHPTrust(false) } }
+            ), presenting: session.hpTrustChallenge) { _ in
+                Button("취소", role: .cancel) { session.answerHPTrust(false) }
+                Button("이 Mac 신뢰") { session.answerHPTrust(true) }
+            } message: { challenge in
+                Text("처음 연결하는 고성능 서버입니다. 연결 대상이 맞는지 확인하세요.\n\(challenge.host):\(String(challenge.port))\nSHA-256: \(challenge.fingerprint)")
+            }
             .onChange(of: scenePhase) { _, phase in
-                if phase != .active { keyboardController.dismiss(); keyboardController.inputView?.releaseAllKeys() }
+                if phase != .active { keyboardController.inputView?.releaseAllKeys(); keyboardController.dismiss() }
+                switch phase {
+                case .active: session.sceneActive()
+                case .inactive: session.sceneInactive()
+                case .background: session.sceneBackground()
+                @unknown default: session.sceneInactive()
+                }
             }
             .onDisappear {
                 keyboardController.dismiss()
-                session.disconnect()
+                if scenePhase == .active { session.disconnect() }
             }
         }
     }
@@ -418,6 +451,8 @@ private struct SessionView: View {
         case .connecting, .handshaking, .authenticating, .initializing: "서버 응답을 기다리고 있습니다."
         case .connected: "첫 번째 화면 업데이트를 기다리고 있습니다."
         case .disconnected: "연결이 종료되었습니다."
+        case .paused: "앱으로 돌아오면 다시 연결합니다. 닫기를 누르면 연결을 취소합니다."
+        case .reconnecting: "네트워크 연결을 복구하고 있습니다. 닫기를 누르면 취소합니다."
         }
     }
 
@@ -431,6 +466,8 @@ private extension VNCSessionModel {
         case .connecting, .handshaking, .authenticating, .initializing: "network"
         case .connected: "display"
         case .disconnected, .ended: "wifi.slash"
+        case .paused: "pause.circle"
+        case .reconnecting: "arrow.clockwise"
         }
     }
 
@@ -446,6 +483,17 @@ private struct UserMessage: Identifiable {
 private final class RemoteKeyboardController {
     fileprivate weak var inputView: RemoteDesktopUIView?
     fileprivate var isFocused = false
+    fileprivate var inputLanguage: String?
+    var inputLanguageLabel: String {
+        guard let inputLanguage, !inputLanguage.isEmpty else { return "언어 미확인" }
+        let base = inputLanguage.replacingOccurrences(of: "_", with: "-").split(separator: "-").first.map(String.init)
+        switch base {
+        case "ko": return "한글"
+        case "en": return "영문"
+        case "emoji": return "이모지"
+        default: return Locale.current.localizedString(forIdentifier: inputLanguage) ?? inputLanguage
+        }
+    }
     func focus() { inputView?.toggleVirtualKeyboard() }
     func dismiss() { _ = inputView?.resignFirstResponder() }
 }
@@ -468,6 +516,9 @@ private struct RemoteDesktopSurface: UIViewRepresentable {
     func makeUIView(context: Context) -> RemoteDesktopUIView {
         let view = RemoteDesktopUIView()
         view.onFocusChanged = { [weak controller] in controller?.isFocused = $0 }
+        view.onInputLanguageChanged = { [weak controller] in
+            if controller?.inputLanguage != $0 { controller?.inputLanguage = $0 }
+        }
         updateUIView(view, context: context)
         return view
     }

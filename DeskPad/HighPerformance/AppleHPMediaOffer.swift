@@ -2,33 +2,41 @@ import Foundation
 import Security
 import zlib
 
-/// Wire offer for the experimental single-picture H.264 / AAC-ELD profile.
+/// Wire offer for the experimental single-picture H.264 or HEVC / AAC-ELD profiles.
 /// No connection, display change, or media playback occurs in this builder.
 nonisolated struct AppleHPMediaOffer {
+    enum VideoProfile: Sendable, CaseIterable {
+        case h264SinglePicture, hevcSinglePicture
+        var payloadType: UInt8 { self == .h264SinglePicture ? 123 : 100 }
+    }
     struct StreamKeys {
         let viewerToServer: Data
         let serverToViewer: Data
     }
-    enum Failure: Error { case randomFailed, compressionFailed, oversizedOffer }
+    enum Failure: Error { case randomFailed, compressionFailed, oversizedOffer, unsupportedLTR }
+    let ltrEnabled: Bool
     let message: Data
     let videoKeys: StreamKeys
     let audioKeys: StreamKeys
     let videoSSRC: UInt32
     let audioSSRC: UInt32
 
-    static func make() throws -> Self {
+    static func make(videoProfile: VideoProfile = .h264SinglePicture, enableLTR: Bool = false, nativeCodecBanks: Bool = false) throws -> Self {
+        guard !enableLTR || videoProfile == .hevcSinglePicture else { throw Failure.unsupportedLTR }
+        guard !nativeCodecBanks || (enableLTR && videoProfile == .hevcSinglePicture) else { throw Failure.unsupportedLTR }
         let video = try makeKeys(), audio = try makeKeys()
         let videoSSRC = try randomSSRC(), audioSSRC = try randomSSRC()
-        let videoOffer = try plist(video: true, ssrc: videoSSRC)
-        let audioOffer = try plist(video: false, ssrc: audioSSRC)
+        let videoOffer = try plist(video: true, ssrc: videoSSRC, profile: videoProfile, enableLTR: enableLTR, nativeCodecBanks: nativeCodecBanks)
+        let audioOffer = try plist(video: false, ssrc: audioSSRC, profile: videoProfile, enableLTR: enableLTR, nativeCodecBanks: nativeCodecBanks)
         let bodySize = 216 + audioOffer.count + videoOffer.count
         guard bodySize <= Int(UInt16.max) else { throw Failure.oversizedOffer }
         var header = Data(repeating: 0, count: 36)
         header[0] = 0x1c
         put16(UInt16(bodySize), into: &header, at: 2)
         put16(3, into: &header, at: 4)
-        // 60 fps first stream + separate cursor. No second video offer.
-        // This scalar is big endian on the wire, including the agent IPC hop.
+        // Stream 1 supports 60 fps; do not include cursor in the media stream.
+        // Big-endian on the wire: the daemon/agent IPC boundary performs
+        // an additional swap, so its unswapped local load is misleading.
         header[9] = 5
         put16(UInt16(audioOffer.count), into: &header, at: 10)
         put16(UInt16(videoOffer.count), into: &header, at: 12)
@@ -38,10 +46,10 @@ nonisolated struct AppleHPMediaOffer {
         let message = header + audio.viewerToServer + audio.serverToViewer + audioOffer
             + video.viewerToServer + video.serverToViewer + videoOffer
         guard message.count == bodySize + 4 else { throw Failure.oversizedOffer }
-        return Self(message: message, videoKeys: video, audioKeys: audio, videoSSRC: videoSSRC, audioSSRC: audioSSRC)
+        return Self(ltrEnabled: enableLTR, message: message, videoKeys: video, audioKeys: audio, videoSSRC: videoSSRC, audioSSRC: audioSSRC)
     }
 
-    private static func plist(video: Bool, ssrc: UInt32) throws -> Data {
+    private static func plist(video: Bool, ssrc: UInt32, profile: VideoProfile, enableLTR: Bool, nativeCodecBanks: Bool) throws -> Data {
         var endpoint = Proto()
         endpoint.number(1, 0); endpoint.number(2, 1)
         endpoint.string(3, "DeskPad"); endpoint.string(4, "1.1")
@@ -50,31 +58,57 @@ nonisolated struct AppleHPMediaOffer {
             "avcMediaStreamNegotiatorMode": video ? 7 : 8,
             "avcMediaStreamOptionRemoteEndpointInfo": endpoint.data,
             "avcMediaStreamOptionCallID": UUID().uuidString,
-            "avcMediaStreamNegotiatorMediaBlob": try compressed(mediaDescription(video: video, ssrc: ssrc))
+            "avcMediaStreamNegotiatorMediaBlob": try compressed(mediaDescription(video: video, ssrc: ssrc, profile: profile, enableLTR: enableLTR, nativeCodecBanks: nativeCodecBanks))
         ]
         let result = try PropertyListSerialization.data(fromPropertyList: dictionary, format: .binary, options: 0)
         guard result.count < 16_384 else { throw Failure.oversizedOffer }
         return result
     }
 
-    private static func mediaDescription(video: Bool, ssrc: UInt32) -> Data {
+    private static func mediaDescription(video: Bool, ssrc: UInt32, profile: VideoProfile, enableLTR: Bool, nativeCodecBanks: Bool) -> Data {
         var description = Proto()
-        description.number(1, UInt64(ssrc)); description.number(2, 0)
+        description.number(1, UInt64(ssrc))
+        // VideoSettings field 2 enables RTCP feedback (including NACK). It is
+        // independent of field 7's explicitly requested LTR feature.
+        // Audio uses a different description schema; preserve its field 2.
+        description.number(2, video ? 1 : 0)
         if video {
+            // Opt-in interoperability experiment matching the native bank order.
+            // The caller must still reject an answer selecting unsupported AVC.
+            // Only bank 123 carries the native LTR capability token; bank 100's
+            // parameter string remains unchanged.
+            if nativeCodecBanks {
+                var alternate = Proto()
+                alternate.number(1, 123)
+                for variant: UInt64 in [1, 2, 1, 2] {
+                    var resolution = Proto()
+                    resolution.number(1, 1); resolution.number(2, variant)
+                    resolution.number(3, 50115); resolution.number(4, 0)
+                    alternate.bytes(2, resolution.data)
+                }
+                alternate.string(3, "FLS;MS:-1;LF:-1;LTR;CABAC;POS:0;EOD:1;HTS:2;RR:3;AR:16/9,5/8;XR:16/9,5/8;")
+                alternate.number(4, 1)
+                description.bytes(3, alternate.data)
+            }
             var codec = Proto()
-            // Apple bank identifier 123 requests H.264 output despite the
-            // historical parameter naming. LTR feedback is not advertised.
-            codec.number(1, 123)
-            for variant in [1, 2, 1, 2] {
+            // These are observed output mappings, not names inferred from codec
+            // parameter strings: bank 123 yields AVC; bank 100 yields HEVC.
+            // Request one picture for either codec, never four dependent tiles.
+            codec.number(1, UInt64(profile.payloadType))
+            let variants = profile == .h264SinglePicture ? [1, 2, 1, 2] : [1, 2]
+            for variant in variants {
                 var resolution = Proto()
                 resolution.number(1, 1); resolution.number(2, UInt64(variant))
                 resolution.number(3, 50115); resolution.number(4, 0)
                 codec.bytes(2, resolution.data)
             }
-            codec.string(3, "FLS;MS:-1;LF:-1;CABAC;POS:0;EOD:1;HTS:2;RR:3;AR:16/9,5/8;XR:16/9,5/8;")
-            codec.number(4, 1)
+            let parameters = profile == .h264SinglePicture
+                ? "FLS;MS:-1;LF:-1;CABAC;POS:0;EOD:1;HTS:2;RR:3;AR:16/9,5/8;XR:16/9,5/8;"
+                : "FLS;LF:-1;POS:5;EOD:1;HTS:2;RR:3;POSE:4;AR:16/9,5/8;XR:16/9,5/8;"
+            codec.string(3, parameters)
+            codec.number(4, profile == .h264SinglePicture ? 1 : 14)
             description.bytes(3, codec.data)
-            description.number(6, 1); description.number(7, 0)
+            description.number(6, 1); description.number(7, enableLTR ? 1 : 0)
             description.number(8, 63); description.number(9, 1); description.number(12, 1)
         } else {
             // AAC-ELD system-audio tier selector, not a target output bitrate.
